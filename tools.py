@@ -5,6 +5,8 @@ import os
 def list_directory(path=".", show_sizes=False, include_dir_size=False):
     """List files and folders with optional size info (read-only, safe)."""
     try:
+        # Expand ~ if it exists and make absolute
+        path = os.path.abspath(os.path.expanduser(path))
         items = os.listdir(path)
         result = []
 
@@ -31,6 +33,7 @@ def list_directory(path=".", show_sizes=False, include_dir_size=False):
 
 def get_dir_size(path):
     """Calculate total size of a directory (recursive)."""
+    path = os.path.expanduser(path)
     total_size = 0
     for root, dirs, files in os.walk(path):
         for f in files:
