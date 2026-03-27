@@ -70,58 +70,83 @@ def main():
             
         messages.append({"role": "user", "content": user_input})
         
-        retries = 1
-        while retries >= 0:
-            print("\nAgent Thought: ", end="", flush=True)
+        last_tool_call = None
+        
+        # Multi-step reasoning loop (Max 5 steps)
+        for step in range(1, 6):
+            print(f"\n[Step {step}] Thinking...", end="", flush=True)
             
+            # Retry logic for JSON parsing
+            retries = 1
+            data = None
             full_raw_response = ""
-            for chunk in service.chat(selected_model, messages, stream=True):
-                full_raw_response += chunk
             
-            data = extract_json(full_raw_response)
-            
-            if data:
-                print(data.get("thought", "..."))
+            while retries >= 0:
+                full_raw_response = ""
+                for chunk in service.chat(selected_model, messages, stream=True):
+                    full_raw_response += chunk
                 
-                tool_name = data.get("tool")
-                args = data.get("args", [])
-                
-                if tool_name:
-                    if tool_name in AVAILABLE_TOOLS:
-                        print(f"[*] Executing {tool_name} with {args}...")
-                        try:
-                            # Validation: args must be list
-                            if not isinstance(args, list):
-                                raise ValueError("Args must be a list.")
-                                
-                            tool_result = AVAILABLE_TOOLS[tool_name](*args)
-                            print(f"[*] Result: {tool_result}")
-                            
-                            messages.append({"role": "assistant", "content": full_raw_response})
-                            messages.append({"role": "user", "content": f"[SYSTEM]: Tool {tool_name} returned: {tool_result}. Respond with the final information in JSON format."})
-                            # Clear retries and loop once more to get final natural response
-                            retries = 0
-                            continue
-                        except Exception as e:
-                            print(f"[!] Error: {e}")
-                            break
-                    else:
-                        print(f"[!] Tool {tool_name} not found.")
-                        break
-                else:
-                    # No tool, just a final thought or information
-                    # We might want to print the thought to the user if it contains the actual answer
-                    # Or adjust the prompt format. For now, let's treat "thought" as the payload.
-                    if not tool_name and data.get("thought") and not any(m['role'] == 'assistant' for m in messages[-2:]):
-                         messages.append({"role": "assistant", "content": full_raw_response})
+                data = extract_json(full_raw_response)
+                if data:
                     break
-            else:
-                if retries > 0:
-                    print("[!] Failed to parse JSON. Retrying...")
-                    messages.append({"role": "user", "content": "Error: Your response was not a valid JSON object. Please respond ONLY in the required JSON format."})
                 else:
-                    print("[!] Persistent JSON parsing error.")
-                retries -= 1
+                    if retries > 0:
+                        print("\n[!] JSON parse failed. Retrying...")
+                        messages.append({"role": "user", "content": "Error: Invalid JSON. Respond ONLY in the required JSON format: {'thought': '...', 'tool': '...', 'args': [...]}"})
+                    retries -= 1
+            
+            if not data:
+                print("\n[!] Persistent JSON error. Stopping reasoning.")
+                break
+                
+            # Clear "Thinking..." and print actual thought
+            print(f"\r[Step {step}] Thought: {data.get('thought', '...')}")
+            
+            tool_name = data.get("tool")
+            args = data.get("args", [])
+            
+            # Stop condition 1: No tool to call
+            if not tool_name or tool_name.lower() == "null":
+                break
+                
+            # Stop condition 2: Infinite loop detection
+            if (tool_name, str(args)) == last_tool_call:
+                print(f"[!] Warning: Repeated tool call ({tool_name}). Stopping to avoid infinite loop.")
+                break
+            
+            last_tool_call = (tool_name, str(args))
+            
+            if tool_name in AVAILABLE_TOOLS:
+                print(f"[*] Executing {tool_name} with {args}...")
+                try:
+                    if not isinstance(args, list):
+                        raise ValueError("Args must be a list.")
+                        
+                    tool_result = AVAILABLE_TOOLS[tool_name](*args)
+                    print(f"[*] Result: {tool_result}")
+                    
+                    # Update context for next reasoning step
+                    messages.append({"role": "assistant", "content": full_raw_response})
+                    messages.append({"role": "user", "content": f"[SYSTEM]: Tool {tool_name} returned: {tool_result}"})
+                except Exception as e:
+                    print(f"[!] Tool Error: {e}")
+                    messages.append({"role": "user", "content": f"[SYSTEM]: Error executing {tool_name}: {e}"})
+            else:
+                print(f"[!] Tool {tool_name} not found.")
+                messages.append({"role": "user", "content": f"[SYSTEM]: Tool {tool_name} is not in AVAILABLE_TOOLS."})
+
+        if step == 5 and tool_name and tool_name.lower() != "null":
+            print("\n[*] Reached max reasoning steps (5). Provide final summary.")
+            # Final request for a summary if max steps reached
+            messages.append({"role": "user", "content": "Max steps reached. Please provide a final summary of results now."})
+            summary_response = ""
+            for chunk in service.chat(selected_model, messages, stream=True):
+                summary_response += chunk
+            data_final = extract_json(summary_response)
+            if data_final:
+                print(f"Final Answer: {data_final.get('thought', '...')}")
+            else:
+                print(f"Final Output: {summary_response}")
 
 if __name__ == "__main__":
     main()
