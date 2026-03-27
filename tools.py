@@ -1,176 +1,361 @@
+import os
+import logging
 import subprocess
 import psutil
-import os
 
-def open_file(path):
-    """Open a file or directory using the default system handler."""
+logger = logging.getLogger("agent")
+
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+
+HOME_DIR = os.path.expanduser("~")
+
+# Commands that are allowed to run
+WHITELISTED_CMDS = {
+    "nvidia-smi", "whoami", "uptime", "df",
+    "ls", "cat", "yt-dlp", "ffmpeg", "ffprobe"
+}
+
+# Commands restricted to home directory paths only
+HOME_RESTRICTED_CMDS = {"cat", "ls"}
+
+# Subprocess timeout in seconds
+CMD_TIMEOUT = 300   # 5 min — covers long yt-dlp / ffmpeg jobs
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def _safe_path(raw: str) -> str:
+    """Expand ~ and resolve to an absolute path."""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def _assert_home(path: str, cmd: str) -> str | None:
+    """
+    Return an error string if `path` escapes the home directory.
+    Returns None if the path is safe.
+    """
+    if not path.startswith(HOME_DIR):
+        return (
+            f"Error: '{cmd}' is restricted to your home directory. "
+            f"Requested path '{path}' is outside '{HOME_DIR}'."
+        )
+    return None
+
+
+def _run(cmd: list, timeout: int = CMD_TIMEOUT) -> tuple[int, str, str]:
+    """
+    Run a subprocess safely.
+    Returns (returncode, stdout, stderr).
+    """
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+# ─────────────────────────────────────────────
+# TOOLS
+# ─────────────────────────────────────────────
+
+def open_file(path: str) -> str:
+    """Open a file or directory using the system default handler (xdg-open)."""
     try:
-        path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.exists(path):
-            return f"Error: Path '{path}' does not exist."
-        
-        # Use xdg-open for Linux
-        subprocess.run(["xdg-open", path], check=True)
-        return f"Successfully opened '{path}'."
-    except Exception as e:
-        return f"Error opening file: {e}"
+        abs_path = _safe_path(path)
 
-def list_directory(path=".", show_sizes=False, include_dir_size=False):
+        if not os.path.exists(abs_path):
+            return f"Error: Path '{abs_path}' does not exist."
+
+        subprocess.Popen(
+            ["xdg-open", abs_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        logger.info(f"Opened: '{abs_path}'")
+        return f"Successfully opened '{abs_path}'."
+
+    except FileNotFoundError:
+        return "Error: 'xdg-open' is not available on this system."
+    except Exception as e:
+        logger.exception(f"open_file failed for '{path}': {e}")
+        return f"Error opening '{path}': {e}"
+
+
+def list_directory(
+    path: str = ".",
+    show_sizes: bool = False,
+    include_dir_size: bool = False
+) -> str:
     """List files and folders with optional size info (read-only, safe)."""
     try:
-        path = os.path.abspath(os.path.expanduser(path))
-        items = os.listdir(path)
+        abs_path = _safe_path(path)
+
+        if not os.path.exists(abs_path):
+            return f"Error: Path '{abs_path}' does not exist."
+        if not os.path.isdir(abs_path):
+            return f"Error: '{abs_path}' is not a directory."
+
+        items = sorted(os.listdir(abs_path))   # sorted for consistent output
+        if not items:
+            return "Directory is empty."
+
         result = []
-
         for item in items:
-            full_path = os.path.join(path, item)
-
-            if os.path.isdir(full_path):
-                if show_sizes and include_dir_size:
-                    size = get_dir_size(full_path)
-                    result.append(f"[DIR] {item} ({size} bytes)")
-                else:
-                    result.append(f"[DIR] {item}")
-            else:
-                if show_sizes:
-                    size = os.path.getsize(full_path)
-                    result.append(f"[FILE] {item} ({size} bytes)")
-                else:
-                    result.append(f"[FILE] {item}")
-
-        return "\n".join(result) if result else "Directory is empty."
-
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def get_dir_size(path):
-    """Calculate total size of a directory (recursive)."""
-    path = os.path.expanduser(path)
-    total_size = 0
-    for root, dirs, files in os.walk(path):
-        for f in files:
+            full_path = os.path.join(abs_path, item)
             try:
-                fp = os.path.join(root, f)
-                total_size += os.path.getsize(fp)
-            except:
-                pass
-    return total_size
+                if os.path.isdir(full_path):
+                    if show_sizes and include_dir_size:
+                        size = _get_dir_size(full_path)
+                        result.append(f"[DIR]  {item}  ({size:,} bytes)")
+                    else:
+                        result.append(f"[DIR]  {item}")
+                else:
+                    if show_sizes:
+                        size = os.path.getsize(full_path)
+                        result.append(f"[FILE] {item}  ({size:,} bytes)")
+                    else:
+                        result.append(f"[FILE] {item}")
+            except OSError as e:
+                result.append(f"[????] {item}  (unreadable: {e})")
 
-def run_safe_command(base_cmd, *args):
-    """Run a whitelisted base command with optional arguments."""
-    WHITELISTED_BASES = {
-        "nvidia-smi", "whoami", "uptime", "df", "ls", "cat", "yt-dlp", "ffmpeg", "ffprobe"
-    }
-    
-    if base_cmd not in WHITELISTED_BASES:
-        return f"Error: Command '{base_cmd}' is not in the safe whitelist. Available: {', '.join(sorted(WHITELISTED_BASES))}"
-    
-    try:
-        # Expand ~ in all arguments
-        expanded_args = [os.path.expanduser(arg) if isinstance(arg, str) else arg for arg in args]
-        
-        # Construct the command list: [base_cmd, arg1, arg2, ...]
-        cmd = [base_cmd] + expanded_args
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return result.stdout if result.stdout else "Command executed successfully (no output)."
-        else:
-            return f"Error executing {base_cmd}: {result.stderr}"
+        logger.info(f"Listed directory: '{abs_path}' ({len(result)} items)")
+        return "\n".join(result)
+
+    except PermissionError:
+        return f"Error: Permission denied reading '{path}'."
     except Exception as e:
-        return f"Error executing command: {e}"
+        logger.exception(f"list_directory failed for '{path}': {e}")
+        return f"Error listing directory: {e}"
 
-def gpu_status():
-    """Shortcut for nvidia-smi."""
+
+def _get_dir_size(path: str) -> int:
+    """Recursively calculate total size of a directory in bytes."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for fname in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fname))
+            except (OSError, PermissionError):
+                pass   # skip unreadable files silently
+    return total
+
+
+def run_safe_command(base_cmd: str, *args) -> str:
+    """
+    Run a whitelisted shell command with optional arguments.
+    'cat' and 'ls' are restricted to the user's home directory.
+    """
+    if base_cmd not in WHITELISTED_CMDS:
+        available = ", ".join(sorted(WHITELISTED_CMDS))
+        return (
+            f"Error: '{base_cmd}' is not in the safe whitelist. "
+            f"Available commands: {available}"
+        )
+
+    # Expand ~ in all string arguments
+    expanded_args = [
+        _safe_path(a) if isinstance(a, str) else a
+        for a in args
+    ]
+
+    # Home-directory restriction for sensitive read commands
+    if base_cmd in HOME_RESTRICTED_CMDS and expanded_args:
+        target = expanded_args[0]
+        err = _assert_home(target, base_cmd)
+        if err:
+            return err
+
+    try:
+        cmd = [base_cmd] + [str(a) for a in expanded_args]
+        logger.info(f"run_safe_command: {cmd}")
+        rc, stdout, stderr = _run(cmd)
+
+        if rc == 0:
+            return stdout if stdout else "Command executed successfully (no output)."
+        else:
+            logger.warning(f"Command '{base_cmd}' exited {rc}: {stderr}")
+            return f"Error running '{base_cmd}' (exit {rc}): {stderr}"
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command '{base_cmd}' timed out after {CMD_TIMEOUT}s.")
+        return f"Error: '{base_cmd}' timed out after {CMD_TIMEOUT} seconds."
+    except FileNotFoundError:
+        return (
+            f"Error: '{base_cmd}' is not installed or not found in PATH. "
+            "Please install it and try again."
+        )
+    except Exception as e:
+        logger.exception(f"run_safe_command failed [{base_cmd}]: {e}")
+        return f"Unexpected error running '{base_cmd}': {e}"
+
+
+def gpu_status() -> str:
+    """Return GPU usage via nvidia-smi."""
     return run_safe_command("nvidia-smi")
 
-def get_system_status():
-    """Get CPU, RAM usage and top processes."""
+
+def get_system_status() -> str:
+    """Return CPU %, RAM usage, and top processes by CPU and memory."""
     try:
         cpu_usage = psutil.cpu_percent(interval=1)
-        ram = psutil.virtual_memory()
-        
-        # Get top 3 processes by memory usage
+        ram       = psutil.virtual_memory()
+
         processes = []
-        for proc in psutil.process_iter(['name', 'cpu_percent', 'memory_percent']):
+        for proc in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
             try:
                 processes.append(proc.info)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        
-        top_cpu = sorted(processes, key=lambda p: p['cpu_percent'], reverse=True)[:3]
-        top_mem = sorted(processes, key=lambda p: p['memory_percent'], reverse=True)[:3]
-        
+
+        top_cpu = sorted(processes, key=lambda p: p["cpu_percent"],    reverse=True)[:3]
+        top_mem = sorted(processes, key=lambda p: p["memory_percent"], reverse=True)[:3]
+
         status = {
-            "cpu_percent": cpu_usage,
-            "ram_total_gb": round(ram.total / (1024**3), 2),
-            "ram_used_gb": round(ram.used / (1024**3), 2),
-            "ram_percent": ram.percent,
+            "cpu_percent":       cpu_usage,
+            "ram_total_gb":      round(ram.total / (1024 ** 3), 2),
+            "ram_used_gb":       round(ram.used  / (1024 ** 3), 2),
+            "ram_percent":       ram.percent,
             "top_processes_cpu": top_cpu,
-            "top_processes_mem": top_mem
+            "top_processes_mem": top_mem,
         }
+        logger.info(f"System status: cpu={cpu_usage}% ram={ram.percent}%")
         return str(status)
+
     except Exception as e:
+        logger.exception(f"get_system_status failed: {e}")
         return f"Error getting system status: {e}"
 
-def check_updates():
-    """Check for system updates on Linux (Debian/Ubuntu)."""
+
+def check_updates() -> str:
+    """Check for upgradable packages via apt (Debian/Ubuntu)."""
     try:
-        # Run apt list --upgradable
-        result = subprocess.run(['apt', 'list', '--upgradable'], capture_output=True, text=True)
-        lines = result.stdout.splitlines()
-        
-        # The first line is usually "Listing..."
-        upgradable = [line for line in lines if '/' in line]
+        rc, stdout, stderr = _run(["apt", "list", "--upgradable"], timeout=30)
+
+        if rc != 0:
+            return (
+                f"Could not check for updates (apt exited {rc}). "
+                f"You may need sudo privileges. Details: {stderr}"
+            )
+
+        upgradable = [l for l in stdout.splitlines() if "/" in l]
         count = len(upgradable)
-        
+
         if count == 0:
             return "Your system is up to date."
-        else:
-            summary = f"Found {count} upgradable packages."
-            if count > 0:
-                examples = ", ".join([pkg.split('/')[0] for pkg in upgradable[:5]])
-                summary += f" Examples: {examples}"
-                if count > 5:
-                    summary += " ..."
-            return summary
+
+        examples  = ", ".join(pkg.split("/")[0] for pkg in upgradable[:5])
+        summary   = f"Found {count} upgradable package(s). Examples: {examples}"
+        if count > 5:
+            summary += f" ... and {count - 5} more."
+        logger.info(f"check_updates: {count} upgradable packages.")
+        return summary
+
+    except subprocess.TimeoutExpired:
+        return "Error: apt timed out while checking for updates."
+    except FileNotFoundError:
+        return "Error: 'apt' is not available. This tool requires a Debian/Ubuntu system."
     except Exception as e:
+        logger.exception(f"check_updates failed: {e}")
         return f"Error checking updates: {e}"
 
-def download_youtube(url):
-    """Download a YouTube video using yt-dlp."""
-    try:
-        # We use -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4' to ensure mp4 format
-        # and --no-playlist to avoid downloading entire playlists
-        cmd = ['yt-dlp', '-f', 'mp4', '--no-playlist', '-o', '%(title)s.%(ext)s', url]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return f"Successfully downloaded video from {url}"
-        else:
-            return f"Error downloading video: {result.stderr}"
-    except Exception as e:
-        return f"Error executing yt-dlp: {e}"
 
-def convert_video(input_file, output_format):
-    """Convert a video file to another format using ffmpeg."""
+def download_youtube(url: str) -> str:
+    """
+    Download a YouTube video using yt-dlp.
+    Returns the saved filepath so memory tracking works correctly.
+    """
     try:
-        output_file = input_file.rsplit('.', 1)[0] + '.' + output_format
-        cmd = ['ffmpeg', '-i', input_file, output_file]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return f"Successfully converted {input_file} to {output_file}"
-        else:
-            return f"Error converting video: {result.stderr}"
-    except Exception as e:
-        return f"Error executing ffmpeg: {e}"
+        cmd = [
+            "yt-dlp",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
+            "--no-playlist",
+            "--print", "after_move:%(filepath)s",   # prints final path after download
+            "-o", os.path.join(HOME_DIR, "%(title)s.%(ext)s"),
+            url,
+        ]
+        logger.info(f"download_youtube: {url}")
+        rc, stdout, stderr = _run(cmd)
 
-# Tool Registry
+        if rc == 0:
+            # Last non-empty line is the saved filepath
+            filepath = stdout.strip().splitlines()[-1] if stdout.strip() else "unknown"
+            logger.info(f"Downloaded: '{filepath}'")
+            return f"Successfully downloaded as {filepath}"
+        else:
+            logger.warning(f"yt-dlp failed (exit {rc}): {stderr[:200]}")
+            return f"Error downloading video: {stderr}"
+
+    except subprocess.TimeoutExpired:
+        return f"Error: yt-dlp timed out after {CMD_TIMEOUT} seconds."
+    except FileNotFoundError:
+        return "Error: 'yt-dlp' is not installed. Install it with: pip install yt-dlp"
+    except Exception as e:
+        logger.exception(f"download_youtube failed: {e}")
+        return f"Error running yt-dlp: {e}"
+
+
+def convert_video(input_file: str, output_format: str) -> str:
+    """
+    Convert a video file to another format using ffmpeg.
+    Will NOT overwrite an existing output file.
+    """
+    try:
+        input_file = _safe_path(input_file)
+
+        if not os.path.exists(input_file):
+            return f"Error: Input file '{input_file}' does not exist."
+
+        # Sanitise format string — letters and digits only
+        output_format = output_format.strip().lstrip(".").lower()
+        if not output_format.isalnum():
+            return f"Error: Invalid output format '{output_format}'."
+
+        base        = os.path.splitext(input_file)[0]
+        output_file = f"{base}.{output_format}"
+
+        if os.path.exists(output_file):
+            return (
+                f"Error: Output file '{output_file}' already exists. "
+                "Rename or remove it first."
+            )
+
+        cmd = ["ffmpeg", "-i", input_file, "-n", output_file]
+        logger.info(f"convert_video: {input_file} → {output_file}")
+        rc, stdout, stderr = _run(cmd)
+
+        if rc == 0:
+            logger.info(f"Conversion complete: '{output_file}'")
+            return f"Successfully converted to {output_file}"
+        else:
+            logger.warning(f"ffmpeg failed (exit {rc}): {stderr[:200]}")
+            return f"Error converting video: {stderr}"
+
+    except subprocess.TimeoutExpired:
+        return f"Error: ffmpeg timed out after {CMD_TIMEOUT} seconds."
+    except FileNotFoundError:
+        return "Error: 'ffmpeg' is not installed. Install it with: sudo apt install ffmpeg"
+    except Exception as e:
+        logger.exception(f"convert_video failed: {e}")
+        return f"Error running ffmpeg: {e}"
+
+
+# ─────────────────────────────────────────────
+# TOOL REGISTRY
+# ─────────────────────────────────────────────
+
 AVAILABLE_TOOLS = {
-    "check_updates": check_updates,
+    "check_updates":    check_updates,
     "download_youtube": download_youtube,
-    "convert_video": convert_video,
+    "convert_video":    convert_video,
     "get_system_status": get_system_status,
     "run_safe_command": run_safe_command,
-    "gpu_status": gpu_status,
-    "list_directory": list_directory,
-    "open_file": open_file
+    "gpu_status":       gpu_status,
+    "list_directory":   list_directory,
+    "open_file":        open_file,
 }

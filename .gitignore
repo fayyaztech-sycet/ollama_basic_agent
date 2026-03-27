@@ -7,3 +7,5 @@ __pycache__/
 *.webm
 *.avi
 memory.json
+agent.log
+settings.json

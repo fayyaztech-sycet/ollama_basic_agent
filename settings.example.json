@@ -1,0 +1,8 @@
+{
+    "ollama_host": "http://localhost:11434",
+    "max_steps": 5,
+    "history_window": 14,
+    "log_file": "agent.log",
+    "log_level": "INFO",
+    "memory_file": "memory.json"
+}
