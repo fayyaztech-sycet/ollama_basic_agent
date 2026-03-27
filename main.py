@@ -1,17 +1,25 @@
 import sys
 import os
 import re
+import json
 from ollama_service import OllamaService
 from tools import AVAILABLE_TOOLS
 
-SYSTEM_PROMPT = """You are a Strict Linux System Agent. You ONLY operate through your provided tools.
+SYSTEM_PROMPT = """You are a Strict Linux System Agent. You MUST respond in valid JSON format ONLY.
+
+RESPONSE FORMAT:
+{
+  "thought": "Your internal reasoning for this step.",
+  "tool": "tool_name or null",
+  "args": ["arg1", "arg2"]
+}
 
 STRICT RULES:
-1. If a user request is NOT covered by a tool, you MUST say: "I am sorry, but I can only perform actions via my authorized tools, and this request is not supported."
-2. NEVER provide manual terminal commands or instructions for the user to run themselves.
-3. NEVER give advice on how to perform tasks outside your toolset.
-4. Format: <tool_call>tool_name("arg1", "arg2")</tool_call> (or use markdown blocks).
-5. When a tool returns a result, provide the data to the user naturally.
+1. ONLY respond with the JSON object. No extra text, no markdown blocks unless it is ONLY the JSON.
+2. If the user request is NOT covered by a tool, set "tool": null and provide the reason in "thought".
+3. NEVER provide manual terminal commands or instructions for the user to run themselves.
+4. "args" MUST be a list of strings, even if empty.
+5. All tool calls MUST be whitelisted.
 
 AVAILABLE TOOLS:
 - check_updates(): Checks for system updates.
@@ -19,15 +27,19 @@ AVAILABLE TOOLS:
 - convert_video(input_file, output_format): Converts video files.
 - get_system_status(): Returns CPU usage, RAM usage, and top processes.
 - gpu_status(): Returns detailed GPU usage (nvidia-smi).
-- run_safe_command(base_cmd, *args): Runs a whitelisted command with any arguments (available bases: "ls", "cat", "df", "uptime", "nvidia-smi", "yt-dlp", "ffmpeg").
-
-EXAMPLES:
-User: show all files
-Assistant: run_safe_command("ls", "-la")
-
-User: check available formats for [URL]
-Assistant: run_safe_command("yt-dlp", "-F", "[URL]")
+- run_safe_command(base_cmd, *args): Runs a whitelisted command (available: "ls", "cat", "df", "uptime", "nvidia-smi", "yt-dlp", "ffmpeg").
 """
+
+def extract_json(text):
+    """Extract and parse JSON from the LLM response."""
+    try:
+        # Try finding JSON between {} if it exists or parse whole
+        match = re.search(r"(\{.*\})", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        return json.loads(text)
+    except Exception:
+        return None
 
 def main():
     service = OllamaService()
@@ -58,53 +70,58 @@ def main():
             
         messages.append({"role": "user", "content": user_input})
         
-        print("\nAgent: ", end="", flush=True)
-        
-        full_response = ""
-        for chunk in service.chat(selected_model, messages, stream=True):
-            print(chunk, end="", flush=True)
-            full_response += chunk
-        print()
-
-        # Robust tool detection
-        # 1. XML Tag: <tool_call>name()</tool_call>
-        # 2. Markdown Block: ```bash name() ```
-        # 3. Standalone: name() on a single line
-        tool_match = re.search(r"<tool_call>(\w+)\((.*?)\)</tool_call>", full_response)
-        if not tool_match:
-            tool_match = re.search(r"```(?:bash|python)?\s*(\w+)\((.*?)\)\s*```", full_response)
-        if not tool_match:
-            # Matches name("arg") if it's the only thing on a line (whitespace allowed)
-            tool_match = re.search(r"^\s*(\w+)\((.*?)\)\s*$", full_response, re.MULTILINE)
+        retries = 1
+        while retries >= 0:
+            print("\nAgent Thought: ", end="", flush=True)
             
-        if tool_match:
-            tool_name = tool_match.group(1)
-            args_str = tool_match.group(2)
-            args = re.findall(r'"([^"]*)"', args_str)
+            full_raw_response = ""
+            for chunk in service.chat(selected_model, messages, stream=True):
+                full_raw_response += chunk
             
-            if tool_name in AVAILABLE_TOOLS:
-                print(f"[*] Executing {tool_name}...")
-                try:
-                    tool_output = AVAILABLE_TOOLS[tool_name](*args)
-                    print(f"[*] Result: {tool_output}")
-                    
-                    # Store history and provide neutral feedback
-                    messages.append({"role": "assistant", "content": full_response})
-                    messages.append({"role": "user", "content": f"[SYSTEM]: Tool {tool_name} returned: {tool_output}. Please provide the resulting information to the user naturally."})
-                    
-                    print("Agent: ", end="", flush=True)
-                    final_response = ""
-                    for chunk in service.chat(selected_model, messages, stream=True):
-                        print(chunk, end="", flush=True)
-                        final_response += chunk
-                    print()
-                    messages.append({"role": "assistant", "content": final_response})
-                except TypeError as e:
-                    print(f"[!] Error: {e}")
+            data = extract_json(full_raw_response)
+            
+            if data:
+                print(data.get("thought", "..."))
+                
+                tool_name = data.get("tool")
+                args = data.get("args", [])
+                
+                if tool_name:
+                    if tool_name in AVAILABLE_TOOLS:
+                        print(f"[*] Executing {tool_name} with {args}...")
+                        try:
+                            # Validation: args must be list
+                            if not isinstance(args, list):
+                                raise ValueError("Args must be a list.")
+                                
+                            tool_result = AVAILABLE_TOOLS[tool_name](*args)
+                            print(f"[*] Result: {tool_result}")
+                            
+                            messages.append({"role": "assistant", "content": full_raw_response})
+                            messages.append({"role": "user", "content": f"[SYSTEM]: Tool {tool_name} returned: {tool_result}. Respond with the final information in JSON format."})
+                            # Clear retries and loop once more to get final natural response
+                            retries = 0
+                            continue
+                        except Exception as e:
+                            print(f"[!] Error: {e}")
+                            break
+                    else:
+                        print(f"[!] Tool {tool_name} not found.")
+                        break
+                else:
+                    # No tool, just a final thought or information
+                    # We might want to print the thought to the user if it contains the actual answer
+                    # Or adjust the prompt format. For now, let's treat "thought" as the payload.
+                    if not tool_name and data.get("thought") and not any(m['role'] == 'assistant' for m in messages[-2:]):
+                         messages.append({"role": "assistant", "content": full_raw_response})
+                    break
             else:
-                print(f"[!] {tool_name} not found.")
-        else:
-            messages.append({"role": "assistant", "content": full_response})
+                if retries > 0:
+                    print("[!] Failed to parse JSON. Retrying...")
+                    messages.append({"role": "user", "content": "Error: Your response was not a valid JSON object. Please respond ONLY in the required JSON format."})
+                else:
+                    print("[!] Persistent JSON parsing error.")
+                retries -= 1
 
 if __name__ == "__main__":
     main()
