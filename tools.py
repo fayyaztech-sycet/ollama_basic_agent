@@ -1,3 +1,48 @@
+import json
+from datetime import datetime
+
+# Token usage tracking with cost calculation
+TOKEN_LOG_PATH = os.path.join(HOME_DIR, ".ollama_agent_token_log.json")
+# Set your cost per 1K tokens (USD)
+IN_TOKEN_COST_PER_1K = 0.002  # Example: $0.002 per 1K input tokens
+OUT_TOKEN_COST_PER_1K = 0.002  # Example: $0.002 per 1K output tokens
+
+def log_token_usage(input_tokens: int, output_tokens: int) -> None:
+    """Log input/output token usage for today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    data = {}
+    if os.path.exists(TOKEN_LOG_PATH):
+        try:
+            with open(TOKEN_LOG_PATH, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    if today not in data:
+        data[today] = {"input": 0, "output": 0}
+    data[today]["input"] += input_tokens
+    data[today]["output"] += output_tokens
+    with open(TOKEN_LOG_PATH, "w") as f:
+        json.dump(data, f)
+
+def get_token_dashboard(days: int = 7) -> str:
+    """Return a dashboard of daily token usage and cost for the last N days."""
+    if not os.path.exists(TOKEN_LOG_PATH):
+        return "No token usage data found."
+    try:
+        with open(TOKEN_LOG_PATH, "r") as f:
+            data = json.load(f)
+        # Sort by date descending
+        items = sorted(data.items(), reverse=True)[:days]
+        lines = ["| Date       | Input | Output | Total | Cost (USD) |", "|------------|-------|--------|-------|------------|"]
+        for date, usage in items:
+            input_tokens = usage.get("input", 0)
+            output_tokens = usage.get("output", 0)
+            total = input_tokens + output_tokens
+            cost = (input_tokens / 1000) * IN_TOKEN_COST_PER_1K + (output_tokens / 1000) * OUT_TOKEN_COST_PER_1K
+            lines.append(f"| {date} | {input_tokens:,} | {output_tokens:,} | {total:,} | ${cost:.4f}     |")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading token dashboard: {e}"
 import os
 import logging
 import subprocess
