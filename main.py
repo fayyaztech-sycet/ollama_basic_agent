@@ -4,13 +4,13 @@ import re
 import json
 import logging
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from dotenv import load_dotenv
 from ollama_service import OllamaService
 from tools import AVAILABLE_TOOLS
 
-# Load .env file if present
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# .env is loaded by load_config(); do not load here to avoid double-loading.
 
 # ─────────────────────────────────────────────
 # ANSI COLORS
@@ -27,34 +27,62 @@ DEBUG_MODE = False
 # CONFIG LOADER
 # ─────────────────────────────────────────────
 
+# Static defaults — used as fallback when an env var is not set
 DEFAULT_CONFIG = {
-    "ollama_host":     os.getenv("OLLAMA_HOST",     "http://localhost:11434"),
-    "max_steps":       int(os.getenv("MAX_STEPS",    "5")),
-    "history_window":  int(os.getenv("HISTORY_WINDOW", "14")),
-    "log_file":        os.getenv("LOG_FILE",        "agent.log"),
-    "log_level":       os.getenv("LOG_LEVEL",       "INFO"),
-    "memory_file":     os.getenv("MEMORY_FILE",     "memory.json"),
+    "ollama_host":    "http://localhost:11434",
+    "max_steps":      5,
+    "history_window": 14,
+    "log_file":       "agent.log",
+    "log_level":      "INFO",
+    "memory_file":    "memory.json",
+    "turn_timeout":   60,
 }
 
-def load_config(path="settings.json") -> dict:
-    """Load settings.json or create it with defaults if missing."""
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                user_config = json.load(f)
-                merged = {**DEFAULT_CONFIG, **user_config}
-                return _validate_config(merged)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"[Warning] Could not read '{path}': {e}. Using defaults.")
+# Mapping: config key → environment variable name
+_ENV_KEYS = {
+    "ollama_host":    "OLLAMA_HOST",
+    "max_steps":      "MAX_STEPS",
+    "history_window": "HISTORY_WINDOW",
+    "log_file":       "LOG_FILE",
+    "log_level":      "LOG_LEVEL",
+    "memory_file":    "MEMORY_FILE",
+    "turn_timeout":   "TURN_TIMEOUT",
+}
+
+def load_config(env_file=".env") -> dict:
+    """Load configuration from a .env file and/or real environment variables."""
+    if os.path.exists(env_file):
+        load_dotenv(dotenv_path=env_file, override=False)
     else:
-        # First run: write defaults so user can edit
+        # First run: write a template .env so the user can customise it
         try:
-            with open(path, "w") as f:
-                json.dump(DEFAULT_CONFIG, f, indent=2)
-            print(f"[Info] Created default '{path}'. Edit it to customize the agent.")
+            _write_env_example(env_file)
+            print(f"[Info] Created '{env_file}' with defaults. Edit it to customise the agent.")
         except IOError as e:
-            print(f"[Warning] Could not create '{path}': {e}.")
-    return DEFAULT_CONFIG.copy()
+            print(f"[Warning] Could not create '{env_file}': {e}.")
+    # Read each key from the environment (set either by .env or the shell)
+    raw = {key: os.getenv(var) for key, var in _ENV_KEYS.items()}
+    # Merge: start from defaults, overlay any value that is actually set
+    merged = {**DEFAULT_CONFIG, **{k: v for k, v in raw.items() if v is not None}}
+    return _validate_config(merged)
+
+
+def _write_env_example(path: str) -> None:
+    """Write a commented .env template."""
+    lines = [
+        "# Ollama Basic Agent — configuration\n",
+        "# Uncomment and edit values as needed.\n",
+        "\n",
+        "# OLLAMA_HOST=http://localhost:11434\n",
+        "# MAX_STEPS=5\n",
+        "# HISTORY_WINDOW=14\n",
+        "# LOG_FILE=agent.log\n",
+        "# LOG_LEVEL=INFO\n",
+        "# MEMORY_FILE=memory.json\n",
+        "# TURN_TIMEOUT=60\n",
+    ]
+    with open(path, "w") as f:
+        f.writelines(lines)
 
 
 _CONFIG_TYPES = {
@@ -64,6 +92,7 @@ _CONFIG_TYPES = {
     "log_file":       str,
     "log_level":      str,
     "memory_file":    str,
+    "turn_timeout":   int,
 }
 
 def _validate_config(cfg: dict) -> dict:
@@ -415,40 +444,58 @@ _RETRY_MSG = (
 )
 
 
+def _run_with_timeout(fn, timeout: int, *args, **kwargs):
+    """
+    Run fn(*args, **kwargs) in a thread with a hard timeout.
+    Returns (result, None) on success or (None, error_string) on timeout/error.
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout), None
+        except FuturesTimeoutError:
+            return None, f"Timed out after {timeout}s."
+        except Exception as e:
+            return None, str(e)
+
+
 def _call_llm_with_validation(
     service: OllamaService,
     model: str,
     messages: list,
     logger: logging.Logger,
     max_retries: int = 3,
+    timeout: int = 60,
 ) -> tuple[dict | None, str]:
     """
     Call the LLM and retry up to max_retries times when JSON is invalid.
+    Each attempt is bounded by `timeout` seconds.
     Returns (parsed_data, raw_response). Streams tokens live to terminal.
     """
-    msgs = list(messages)   # local copy so we can append retry hints
+    msgs = list(messages)
     raw = ""
 
     for attempt in range(max_retries):
         raw = ""
-        stream_error = False
-
-        # ── Live streaming: print tokens as they arrive ──
         print(f"\n{COLOR_AI}Agent:{COLOR_RESET} ", end="", flush=True)
-        try:
+
+        def _stream() -> str:
+            """Collect streamed chunks; print them live. Returns full text."""
+            buf = ""
             for chunk in service.chat(model, msgs, stream=True):
-                raw += chunk
-                # Only print if it looks like prose (not JSON scaffolding noise)
+                buf += chunk
                 print(chunk, end="", flush=True)
-        except RuntimeError as e:
-            logger.error(f"Stream error (attempt {attempt + 1}): {e}")
-            stream_error = True
+            return buf
 
-        print()   # newline after streamed content
+        result, err = _run_with_timeout(_stream, timeout)
+        print()  # newline after stream
 
-        if stream_error:
-            break
+        if err:
+            logger.error(f"LLM call timed out or failed (attempt {attempt + 1}): {err}")
+            print(f"({COLOR_DEBUG}⏱ {err} — press Enter or rephrase to continue{COLOR_RESET})")
+            return None, err
 
+        raw = result or ""
         data = extract_json(raw)
         if data:
             return data, raw
@@ -494,6 +541,7 @@ def run_agent(config: dict, logger: logging.Logger):
 
     MAX_STEPS      = config["max_steps"]
     HISTORY_WINDOW = config["history_window"]
+    TURN_TIMEOUT   = config["turn_timeout"]
     # Ensure we always slice on an even boundary so user/assistant pairs stay together
     if HISTORY_WINDOW % 2 != 0:
         HISTORY_WINDOW += 1
@@ -537,7 +585,7 @@ def run_agent(config: dict, logger: logging.Logger):
             logger.debug(f"Step {step}: sending {len(messages)} messages to model.")
 
             data, raw = _call_llm_with_validation(
-                service, selected_model, messages, logger
+                service, selected_model, messages, logger, timeout=TURN_TIMEOUT
             )
 
             if not data:
@@ -590,18 +638,15 @@ def run_agent(config: dict, logger: logging.Logger):
                 print(f"{COLOR_DEBUG}[*] Calling {tool_name}({', '.join(map(str, args))})...{COLOR_RESET}")
             logger.debug(f"Executing: {tool_name}({args})")
 
-            try:
-                tool_result = AVAILABLE_TOOLS[tool_name](*args)
-                print(f"\n{COLOR_AI}[{tool_name}]{COLOR_RESET} {tool_result}")
-                logger.debug(f"Tool result [{tool_name}]: {str(tool_result)[:300]}")
-            except TypeError as e:
-                tool_result = f"Tool '{tool_name}' was called with wrong arguments: {e}."
-                logger.error(f"TypeError in '{tool_name}': {e}")
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {tool_result}")
-            except Exception as e:
-                tool_result = f"Unexpected error in '{tool_name}': {e}."
-                logger.exception(f"Error in '{tool_name}': {e}")
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {tool_result}")
+            tool_fn = AVAILABLE_TOOLS[tool_name]
+            tool_result, tool_err = _run_with_timeout(tool_fn, TURN_TIMEOUT, *args)
+            if tool_err and tool_result is None:
+                tool_result = f"Error: tool '{tool_name}' timed out or failed — {tool_err}"
+                logger.error(f"Tool '{tool_name}' error: {tool_err}")
+
+            tool_result = str(tool_result)
+            print(f"\n{COLOR_AI}[{tool_name}]{COLOR_RESET} {tool_result}")
+            logger.debug(f"Tool result [{tool_name}]: {tool_result[:300]}")
 
             mem.update(tool_name, str(tool_result), args)
 
@@ -644,14 +689,14 @@ def main():
         help="Enable debug output (overrides DEBUG env var and log_level setting)"
     )
     parser.add_argument(
-        "--config", default="settings.json",
-        help="Path to settings JSON file (default: settings.json)"
+        "--env", default=".env",
+        help="Path to .env file (default: .env)"
     )
     args = parser.parse_args()
 
     DEBUG_MODE = args.debug or os.getenv("DEBUG", "false").strip().lower() == "true"
 
-    config = load_config(args.config)
+    config = load_config(args.env)
     logger = setup_logger(config["log_file"], config["log_level"], debug_mode=DEBUG_MODE)
 
     logger.info("=" * 50)

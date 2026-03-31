@@ -150,8 +150,10 @@ class OllamaService:
                     )
                     break
 
-        except requests.ChunkedEncodingError as e:
+        except requests.exceptions.ChunkedEncodingError as e:
             raise RuntimeError(f"Stream was interrupted unexpectedly: {e}")
+        except KeyboardInterrupt:
+            raise
 
     def _chat_blocking(self, url: str, payload: dict) -> str:
         """Private method for non-streaming chat responses."""
