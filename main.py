@@ -95,22 +95,28 @@ def setup_logger(log_file: str, log_level: str) -> logging.Logger:
 # SYSTEM PROMPT
 # ─────────────────────────────────────────────
 
-BASE_SYSTEM_PROMPT = """You are a Strict Linux System Agent with persistent memory. You MUST respond in valid JSON format ONLY.
+BASE_SYSTEM_PROMPT = """You are a helpful Linux System Agent with persistent memory. You MUST respond in valid JSON format ONLY.
 
 RESPONSE FORMAT:
 {{
-  "thought": "Your internal reasoning for this step.",
+  "message": "What to display to the user. See rules below.",
   "tool": "tool_name or null",
   "args": ["arg1", "arg2"]
 }}
 
+CRITICAL RULE — "message" field:
+- When "tool" is null  → "message" = your complete reply, written directly to the user as natural speech.
+  BAD:  "User greeted me. I will now list my capabilities and set tool to null."
+  GOOD: "Hello! I'm your local Linux AI assistant. Here's what I can do: ..."
+- When "tool" is set   → "message" = one short sentence explaining why you chose that tool.
+
 STRICT RULES:
-1. ONLY respond with the JSON object. No extra text. No explanation after the closing brace.
-2. If a request is a general question (Knowledge/Why/What/greeting) not requiring a tool, set "tool": null and provide a helpful, friendly reply in "thought".
-3. NEVER provide manual terminal commands or instructions for the user to run.
-4. "args" MUST always be a list, even if empty: [].
-5. PATIENCE: Never open a file or run a command unless explicitly asked. If you find something, report it first.
-6. GREETINGS: If the user says hello/hi/hey or asks what you can do, respond warmly in "thought" with a short introduction and a bulleted list of your capabilities. Do NOT overthink it.
+1. Respond with the JSON object ONLY. Double-quoted keys and values. No markdown, no code fences, no extra text.
+2. For greetings or general questions: set "tool": null, write the actual user-facing reply in "message".
+3. For actionable requests (status, ping, list files, etc.): set "tool" to the correct tool name and call it — do NOT just describe what you would do.
+4. NEVER provide manual terminal commands for the user to run yourself.
+5. "args" MUST always be a JSON array, even when empty: [].
+6. PATIENCE: Never open a file or run a command unless explicitly asked.
 
 AVAILABLE TOOLS:
 System:
@@ -155,16 +161,17 @@ Scheduler:
 - set_reminder(message, time): Set a terminal reminder via the 'at' daemon.
 
 TOOL USAGE EXAMPLES:
-- User: "hi" / "hello"           → {{"thought": "Hello! I'm your local Linux AI assistant. Here's what I can do:\n\n• System monitoring — CPU, RAM, GPU, processes\n• File operations — search, list, read files\n• Network tools — ping, traceroute, network status\n• Media — download YouTube, convert videos and images\n• Process management — list, kill, restart processes\n• File transfer — download from URLs, upload via rsync\n• AI utilities — summarize or translate text\n• Scheduler — set task schedules and reminders\n\nHow can I help you today?", "tool": null, "args": []}}
-- User: "read ~/.bashrc"         → {{"thought": "...", "tool": "run_safe_command", "args": ["cat", "~/.bashrc"]}}
-- User: "what time is it?"       → {{"thought": "...", "tool": "run_safe_command", "args": ["date"]}}
-- User: "list home directory"    → {{"thought": "...", "tool": "run_safe_command", "args": ["ls", "~"]}}
-- User: "check disk space"       → {{"thought": "...", "tool": "run_safe_command", "args": ["df", "-h"]}}
-- User: "show my username"       → {{"thought": "...", "tool": "run_safe_command", "args": ["whoami"]}}
-- User: "find *.mp4 files"       → {{"thought": "...", "tool": "search_files", "args": ["*.mp4"]}}
-- User: "list processes"         → {{"thought": "...", "tool": "list_processes", "args": []}}
-- User: "network status"         → {{"thought": "...", "tool": "network_status", "args": []}}
-- User: "ping google.com"        → {{"thought": "...", "tool": "ping_host", "args": ["google.com"]}}
+- User: "hi" / "hello"           → {{"message": "Hello! I'm your local Linux AI assistant powered by Ollama. Here's what I can help you with:\n\n• System monitoring — CPU, RAM, GPU, disk, processes\n• File operations — search, list, read files\n• Network tools — ping, traceroute, interface status\n• Media — download YouTube, convert/resize/analyze images & videos\n• Process management — list, kill, restart processes\n• File transfer — download from URLs, upload via rsync\n• AI utilities — summarize or translate text\n• Scheduler — schedule tasks and set reminders\n\nWhat would you like to do?", "tool": null, "args": []}}
+- User: "what's my CPU/RAM?"     → {{"message": "Fetching system status.", "tool": "get_system_status", "args": []}}
+- User: "ping google.com"        → {{"message": "Pinging google.com.", "tool": "ping_host", "args": ["google.com"]}}
+- User: "read ~/.bashrc"         → {{"message": "Reading .bashrc.", "tool": "run_safe_command", "args": ["cat", "~/.bashrc"]}}
+- User: "what time is it?"       → {{"message": "Checking the time.", "tool": "run_safe_command", "args": ["date"]}}
+- User: "list home directory"    → {{"message": "Listing home directory.", "tool": "run_safe_command", "args": ["ls", "~"]}}
+- User: "check disk space"       → {{"message": "Checking disk space.", "tool": "run_safe_command", "args": ["df", "-h"]}}
+- User: "show my username"       → {{"message": "Getting username.", "tool": "run_safe_command", "args": ["whoami"]}}
+- User: "find *.mp4 files"       → {{"message": "Searching for mp4 files.", "tool": "search_files", "args": ["*.mp4"]}}
+- User: "list processes"         → {{"message": "Listing running processes.", "tool": "list_processes", "args": []}}
+- User: "network status"         → {{"message": "Checking network interfaces.", "tool": "network_status", "args": []}}
 
 TIPS:
 - Paths: "~" expands to your home directory.
@@ -254,40 +261,67 @@ def extract_json(text: str) -> dict | None:
     """
     Extract and parse a JSON object from LLM output.
 
-    Strategy:
-      1. Find ALL {...} blocks in the text.
-      2. Try each from largest to smallest — the biggest block is most
-         likely the complete response, not a fragment.
-      3. Only accept objects that contain at least a 'thought' key,
-         which guards against partial blocks like {"tool": null, "args": []}.
-      4. Fall back to parsing the whole text if no block matched.
-
-    This handles models (e.g. deepseek) that emit valid JSON then keep
-    writing prose after the closing brace.
+    Handles:
+    - Markdown code fences (```json ... ```)
+    - Prose before/after the JSON object
+    - Single-quoted keys/values (simple cases)
+    - Both 'message' (new) and 'thought' (legacy) field names
     """
-    # Collect all {...} spans, sorted by length descending
-    candidates = sorted(
-        re.findall(r"\{.*?\}|\{.*\}", text, re.DOTALL),
-        key=len,
-        reverse=True
-    )
-    for candidate in candidates:
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict) and "thought" in obj:
-                return obj
-        except json.JSONDecodeError:
+    # 1. Strip markdown code fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.replace("```", "").strip()
+
+    def _try_parse(s: str) -> dict | None:
+        """Try JSON parse; if it fails, retry after converting single quotes."""
+        for candidate in (s, s.replace("'", '"')):
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict) and ("message" in obj or "thought" in obj):
+                    return obj
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
+
+    # 2. Greedy scan: find the largest {...} block spanning the whole object.
+    #    Walk from each '{' forward, tracking brace depth.
+    best: dict | None = None
+    best_len = 0
+    for start in range(len(cleaned)):
+        if cleaned[start] != '{':
             continue
+        depth = 0
+        in_string = False
+        escape = False
+        for end in range(start, len(cleaned)):
+            ch = cleaned[end]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    span = cleaned[start:end + 1]
+                    if len(span) > best_len:
+                        obj = _try_parse(span)
+                        if obj:
+                            best = obj
+                            best_len = len(span)
+                    break
+    if best:
+        return best
 
-    # Last resort: try the whole text
-    try:
-        obj = json.loads(text.strip())
-        if isinstance(obj, dict):
-            return obj
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    return None
+    # 3. Last resort: the whole cleaned text
+    return _try_parse(cleaned.strip())
 
 
 def select_model(models: list, logger: logging.Logger) -> str:
@@ -362,7 +396,7 @@ def run_agent(config: dict, logger: logging.Logger):
             logger.info("Session ended by user command.")
             break
 
-        logger.info(f"User: {user_input}")
+        logger.debug(f"User: {user_input}")
         history.append({"role": "user", "content": user_input})
 
         current_system_prompt = BASE_SYSTEM_PROMPT.format(
@@ -404,7 +438,11 @@ def run_agent(config: dict, logger: logging.Logger):
                     logger.warning(f"Step {step}: invalid JSON from model — retrying once.")
                     messages.append({
                         "role": "user",
-                        "content": "Error: Your last response was not valid JSON. Respond ONLY with the JSON object."
+                        "content": (
+                            'Error: Your last response was not valid JSON. '
+                            'Reply with ONLY a raw JSON object — no markdown, no code fences, no extra text. '
+                            'Example: {"message": "your reply here", "tool": null, "args": []}'
+                        )
                     })
 
             if not data:
@@ -412,7 +450,8 @@ def run_agent(config: dict, logger: logging.Logger):
                 print(f"\n{COLOR_AI}Agent:{COLOR_RESET} The model returned an unreadable response. Please try rephrasing your request.")
                 break
 
-            thought    = data.get("thought", "")
+            # Support both new 'message' field and legacy 'thought' field
+            message    = data.get("message") or data.get("thought", "")
             tool_name  = data.get("tool")
             args       = data.get("args", [])
 
@@ -420,15 +459,15 @@ def run_agent(config: dict, logger: logging.Logger):
             if not isinstance(args, list):
                 args = [args]
 
-            logger.debug(f"Step {step} | tool={tool_name} | args={args} | thought={thought[:80]}")
+            logger.debug(f"Step {step} | tool={tool_name} | args={args} | message={message[:80]}")
             if DEBUG_MODE:
                 print(f"{COLOR_DEBUG}[Step {step}] tool={tool_name} | args={args}{COLOR_RESET}")
 
             # ── No tool → final answer ──
             if not tool_name or str(tool_name).lower() == "null":
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {thought}")
-                logger.debug(f"Agent response: {thought}")
-                history.append({"role": "assistant", "content": thought})
+                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {message}")
+                logger.debug(f"Agent response: {message}")
+                history.append({"role": "assistant", "content": message})
                 responded = True
                 break
 
