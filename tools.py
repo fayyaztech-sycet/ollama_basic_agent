@@ -93,15 +93,33 @@ def _safe_path(raw: str) -> str:
     return os.path.abspath(os.path.expanduser(raw))
 
 
+def sanitize_path(raw: str, allowed_root: str = HOME_DIR) -> tuple[str, str | None]:
+    """
+    Resolve path and verify it stays within allowed_root (blocks path traversal).
+    Returns (resolved_path, error_string_or_None).
+    e.g. sanitize_path("../../etc/passwd") → error
+    """
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+    allowed  = os.path.realpath(allowed_root)
+    if not resolved.startswith(allowed + os.sep) and resolved != allowed:
+        return resolved, (
+            f"Error: Path traversal blocked. "
+            f"'{raw}' resolves to '{resolved}' which is outside '{allowed}'."
+        )
+    return resolved, None
+
+
 def _assert_home(path: str, cmd: str) -> str | None:
     """
-    Return an error string if `path` escapes the home directory.
+    Return an error string if `path` escapes the home directory (resolves symlinks).
     Returns None if the path is safe.
     """
-    if not path.startswith(HOME_DIR):
+    real_path = os.path.realpath(path)
+    real_home = os.path.realpath(HOME_DIR)
+    if not real_path.startswith(real_home + os.sep) and real_path != real_home:
         return (
             f"Error: '{cmd}' is restricted to your home directory. "
-            f"Requested path '{path}' is outside '{HOME_DIR}'."
+            f"Requested path '{path}' resolves to '{real_path}' which is outside '{real_home}'."
         )
     return None
 
@@ -224,12 +242,15 @@ def run_safe_command(base_cmd: str, *args) -> str:
         for a in args
     ]
 
-    # Home-directory restriction for sensitive read commands
+    # Home-directory restriction for sensitive read commands — blocks path traversal
     if base_cmd in HOME_RESTRICTED_CMDS and expanded_args:
-        target = expanded_args[0]
-        err = _assert_home(target, base_cmd)
-        if err:
-            return err
+        # Find the first non-flag argument (the target path)
+        for i, arg in enumerate(expanded_args):
+            if isinstance(arg, str) and not str(args[i]).startswith("-"):
+                _, err = sanitize_path(arg, HOME_DIR)
+                if err:
+                    return err
+                break
 
     try:
         cmd = [base_cmd] + [str(a) for a in expanded_args]

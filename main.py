@@ -3,6 +3,7 @@ import os
 import re
 import json
 import logging
+import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 from ollama_service import OllamaService
@@ -19,7 +20,8 @@ COLOR_AI    = "\033[92m"   # Green — AI response
 COLOR_DEBUG = "\033[33m"   # Yellow — debug steps
 COLOR_RESET = "\033[0m"
 
-DEBUG_MODE = os.getenv("DEBUG", "false").strip().lower() == "true"
+# DEBUG_MODE is set after argparse in main(); default False until then
+DEBUG_MODE = False
 
 # ─────────────────────────────────────────────
 # CONFIG LOADER
@@ -40,8 +42,8 @@ def load_config(path="settings.json") -> dict:
         try:
             with open(path, "r") as f:
                 user_config = json.load(f)
-                # Merge: user values override defaults
-                return {**DEFAULT_CONFIG, **user_config}
+                merged = {**DEFAULT_CONFIG, **user_config}
+                return _validate_config(merged)
         except (json.JSONDecodeError, IOError) as e:
             print(f"[Warning] Could not read '{path}': {e}. Using defaults.")
     else:
@@ -55,14 +57,39 @@ def load_config(path="settings.json") -> dict:
     return DEFAULT_CONFIG.copy()
 
 
+_CONFIG_TYPES = {
+    "ollama_host":    str,
+    "max_steps":      int,
+    "history_window": int,
+    "log_file":       str,
+    "log_level":      str,
+    "memory_file":    str,
+}
+
+def _validate_config(cfg: dict) -> dict:
+    """Coerce config values to expected types; fall back to defaults on failure."""
+    out = dict(cfg)
+    for key, typ in _CONFIG_TYPES.items():
+        if key not in out:
+            out[key] = DEFAULT_CONFIG[key]
+            continue
+        try:
+            out[key] = typ(out[key])
+        except (ValueError, TypeError):
+            print(f"[Warning] Config key '{key}' has invalid value '{out[key]}'; "
+                  f"using default '{DEFAULT_CONFIG[key]}'.")
+            out[key] = DEFAULT_CONFIG[key]
+    return out
+
+
 # ─────────────────────────────────────────────
 # LOGGER SETUP
 # ─────────────────────────────────────────────
 
-def setup_logger(log_file: str, log_level: str) -> logging.Logger:
+def setup_logger(log_file: str, log_level: str, debug_mode: bool = False) -> logging.Logger:
     """Configure a logger that writes to both file and stdout."""
     logger = logging.getLogger("agent")
-    level = getattr(logging, log_level.upper(), logging.INFO)
+    level = logging.DEBUG if debug_mode else getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
 
     # Avoid adding duplicate handlers on re-import
@@ -74,7 +101,7 @@ def setup_logger(log_file: str, log_level: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # File handler
+    # File handler — always full detail
     try:
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
@@ -82,10 +109,10 @@ def setup_logger(log_file: str, log_level: str) -> logging.Logger:
     except IOError as e:
         print(f"[Warning] Cannot write to log file '{log_file}': {e}")
 
-    # Console handler (INFO and above only — keeps terminal clean)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(message)s"))  # plain for console
+    # Console handler — DEBUG when --debug, else WARNING (keeps terminal clean)
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setLevel(logging.DEBUG if debug_mode else logging.WARNING)
+    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     logger.addHandler(ch)
 
     return logger
@@ -111,14 +138,15 @@ CRITICAL RULE — "message" field:
 - When "tool" is set   → "message" = one short sentence explaining why you chose that tool.
 
 STRICT RULES:
-1. Respond with the JSON object ONLY. Double-quoted keys and values. No markdown, no code fences, no extra text.
-2. For greetings or general questions: set "tool": null, write the actual user-facing reply in "message".
-3. For actionable requests (status, ping, list files, etc.): set "tool" to the correct tool name and call it — do NOT just describe what you would do.
-4. NEVER provide manual terminal commands for the user to run yourself.
+1. Respond with the JSON object ONLY. Double-quoted keys and values. No markdown, no code fences, no extra text before or after the JSON.
+2. NEVER guess or make up system facts. For ANY of the following, you MUST call a tool — never answer from memory:
+   - IP address, hostname, username, current time/date, disk space, CPU/RAM, GPU, network interfaces, running processes, system uptime, OS info.
+3. For greetings or purely conversational questions: set "tool": null, write the reply in "message".
+4. NEVER provide manual terminal commands for the user to run.
 5. "args" MUST always be a JSON array, even when empty: [].
-6. FLAGS vs PATHS: When passing flags like -h, -l, -a to run_safe_command, keep them as-is (e.g. ["df", "-h"] not ["-h"] as a path). Flags always come before paths.
-7. CONTEXT: If the answer can be derived from a previous tool result already in the conversation, answer directly with tool null — do NOT call the tool again.
-8. After calling a tool the result is shown immediately. Your job for that turn is done — do not add commentary unless the user asks.
+6. FLAGS vs PATHS: Flags like -h, -l, -a must stay as flags (e.g. ["df", "-h"]). Never expand a flag into a path.
+7. CONTEXT: If the answer is already in a previous tool result in the conversation, answer directly without calling the tool again.
+8. "is X working" / "is X reachable" / "check X" for a hostname → use ping_host(X).
 
 AVAILABLE TOOLS:
 System:
@@ -164,17 +192,21 @@ Scheduler:
 - set_reminder(message, time): Set a terminal reminder via the 'at' daemon.
 
 TOOL USAGE EXAMPLES:
-- User: "hi" / "hello"           → {{"message": "Hello! I'm your local Linux AI assistant powered by Ollama. Here's what I can help you with:\n\n• System monitoring — CPU, RAM, GPU, disk, processes\n• File operations — search, list, read files\n• Network tools — ping, traceroute, interface status\n• Media — download YouTube, convert/resize/analyze images & videos\n• Process management — list, kill, restart processes\n• File transfer — download from URLs, upload via rsync\n• AI utilities — summarize or translate text\n• Scheduler — schedule tasks and set reminders\n\nWhat would you like to do?", "tool": null, "args": []}}
+- User: "hi" / "hello"           → {{"message": "Hello! I'm your local Linux AI assistant powered by Ollama. Here's what I can help you with:\n\n• System monitoring — CPU, RAM, GPU, disk, processes\n• File operations — search, list, read files\n• Network tools — ping, traceroute, interface status, speed test\n• Media — download YouTube, convert/resize/analyze images & videos\n• Process management — list, kill, restart processes\n• File transfer — download from URLs, upload via rsync\n• AI utilities — summarize or translate text\n• Scheduler — schedule tasks and set reminders\n\nWhat would you like to do?", "tool": null, "args": []}}
+- User: "what is my IP" / "local IP" → {{"message": "Fetching network interfaces.", "tool": "network_status", "args": []}}
+- User: "what is my username"    → {{"message": "Getting username.", "tool": "run_safe_command", "args": ["whoami"]}}
+- User: "what time is it"        → {{"message": "Checking current time.", "tool": "run_safe_command", "args": ["date"]}}
 - User: "what's my CPU/RAM?"     → {{"message": "Fetching system status.", "tool": "get_system_status", "args": []}}
 - User: "ping google.com"        → {{"message": "Pinging google.com.", "tool": "ping_host", "args": ["google.com"]}}
+- User: "is google.com working"  → {{"message": "Checking if google.com is reachable.", "tool": "ping_host", "args": ["google.com"]}}
+- User: "check if 8.8.8.8 is up" → {{"message": "Pinging 8.8.8.8.", "tool": "ping_host", "args": ["8.8.8.8"]}}
 - User: "read ~/.bashrc"         → {{"message": "Reading .bashrc.", "tool": "run_safe_command", "args": ["cat", "~/.bashrc"]}}
-- User: "what time is it?"       → {{"message": "Checking the time.", "tool": "run_safe_command", "args": ["date"]}}
 - User: "list home directory"    → {{"message": "Listing home directory.", "tool": "run_safe_command", "args": ["ls", "~"]}}
 - User: "check disk space"       → {{"message": "Checking disk space.", "tool": "run_safe_command", "args": ["df", "-h"]}}
-- User: "show my username"       → {{"message": "Getting username.", "tool": "run_safe_command", "args": ["whoami"]}}
 - User: "find *.mp4 files"       → {{"message": "Searching for mp4 files.", "tool": "search_files", "args": ["*.mp4"]}}
 - User: "list processes"         → {{"message": "Listing running processes.", "tool": "list_processes", "args": []}}
 - User: "network status"         → {{"message": "Checking network interfaces.", "tool": "network_status", "args": []}}
+- User: "test internet speed"    → {{"message": "Running speed test.", "tool": "internet_speed", "args": []}}
 
 TIPS:
 - Paths: "~" expands to your home directory.
@@ -222,7 +254,7 @@ class MemoryManager:
                     return data
             except (json.JSONDecodeError, IOError) as e:
                 self.logger.warning(f"Could not load memory from '{self.filename}': {e}. Starting fresh.")
-        return {"last_file": "None", "last_command": "None", "notes": []}
+        return {"last_file": "None", "last_command": "None", "notes": [], "interactions": []}
 
     def save(self):
         try:
@@ -230,6 +262,20 @@ class MemoryManager:
                 json.dump(self.memory, f, indent=2)
         except IOError as e:
             self.logger.warning(f"Could not save memory: {e}")
+
+    def add_interaction(self, user_msg: str, agent_reply: str, max_entries: int = 20):
+        """Store a rolling summary of recent user↔agent exchanges."""
+        entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "user": user_msg[:120],
+            "agent": agent_reply[:200],
+        }
+        interactions = self.memory.setdefault("interactions", [])
+        interactions.append(entry)
+        # Keep only the last max_entries
+        if len(interactions) > max_entries:
+            self.memory["interactions"] = interactions[-max_entries:]
+        self.save()
 
     def update(self, tool_name: str, result: str, args: list):
         self.memory["last_command"] = f"{tool_name}({', '.join(map(str, args))})"
@@ -253,7 +299,13 @@ class MemoryManager:
         self.logger.debug(f"Memory updated: {self.memory}")
 
     def get_context(self) -> str:
-        return json.dumps(self.memory, indent=2)
+        ctx = {
+            "last_file":    self.memory.get("last_file", "None"),
+            "last_command": self.memory.get("last_command", "None"),
+            "notes":        self.memory.get("notes", []),
+            "recent_interactions": self.memory.get("interactions", [])[-5:],
+        }
+        return json.dumps(ctx, indent=2)
 
 
 # ─────────────────────────────────────────────
@@ -274,6 +326,11 @@ def extract_json(text: str) -> dict | None:
     cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
     cleaned = cleaned.replace("```", "").strip()
 
+    # 2. Discard anything before the first '{' (prose/headers the model prepends)
+    brace_start = cleaned.find('{')
+    if brace_start > 0:
+        cleaned = cleaned[brace_start:]
+
     def _try_parse(s: str) -> dict | None:
         """Try JSON parse; if it fails, retry after converting single quotes."""
         for candidate in (s, s.replace("'", '"')):
@@ -285,7 +342,7 @@ def extract_json(text: str) -> dict | None:
                 pass
         return None
 
-    # 2. Greedy scan: find the largest {...} block spanning the whole object.
+    # 3. Greedy scan: find the largest {...} block spanning the whole object.
     #    Walk from each '{' forward, tracking brace depth.
     best: dict | None = None
     best_len = 0
@@ -350,6 +407,61 @@ def select_model(models: list, logger: logging.Logger) -> str:
 # MAIN AGENT LOOP
 # ─────────────────────────────────────────────
 
+_RETRY_MSG = (
+    'INVALID RESPONSE. Reply with ONLY a raw JSON object — '
+    'no markdown, no code fences, no prose before or after the braces. '
+    'Required structure: {"message": "<text>", "tool": null, "args": []} '
+    'or {"message": "<reason>", "tool": "<tool_name>", "args": ["<arg1>"]}'
+)
+
+
+def _call_llm_with_validation(
+    service: OllamaService,
+    model: str,
+    messages: list,
+    logger: logging.Logger,
+    max_retries: int = 3,
+) -> tuple[dict | None, str]:
+    """
+    Call the LLM and retry up to max_retries times when JSON is invalid.
+    Returns (parsed_data, raw_response). Streams tokens live to terminal.
+    """
+    msgs = list(messages)   # local copy so we can append retry hints
+    raw = ""
+
+    for attempt in range(max_retries):
+        raw = ""
+        stream_error = False
+
+        # ── Live streaming: print tokens as they arrive ──
+        print(f"\n{COLOR_AI}Agent:{COLOR_RESET} ", end="", flush=True)
+        try:
+            for chunk in service.chat(model, msgs, stream=True):
+                raw += chunk
+                # Only print if it looks like prose (not JSON scaffolding noise)
+                print(chunk, end="", flush=True)
+        except RuntimeError as e:
+            logger.error(f"Stream error (attempt {attempt + 1}): {e}")
+            stream_error = True
+
+        print()   # newline after streamed content
+
+        if stream_error:
+            break
+
+        data = extract_json(raw)
+        if data:
+            return data, raw
+
+        logger.warning(
+            f"Invalid JSON on attempt {attempt + 1}/{max_retries}. "
+            f"Raw (first 200): {raw[:200]!r}"
+        )
+        msgs.append({"role": "user", "content": _RETRY_MSG})
+
+    return None, raw
+
+
 def run_agent(config: dict, logger: logging.Logger):
     service = OllamaService(base_url=config["ollama_host"])
     mem = MemoryManager(filename=config["memory_file"], logger=logger)
@@ -380,8 +492,11 @@ def run_agent(config: dict, logger: logging.Logger):
     print(f"\n{COLOR_AI}Agent is ready!{COLOR_RESET} (type 'quit' or 'exit' to stop)\n")
     print("─" * 50)
 
-    MAX_STEPS     = config["max_steps"]
+    MAX_STEPS      = config["max_steps"]
     HISTORY_WINDOW = config["history_window"]
+    # Ensure we always slice on an even boundary so user/assistant pairs stay together
+    if HISTORY_WINDOW % 2 != 0:
+        HISTORY_WINDOW += 1
     history: list[dict] = []
 
     while True:
@@ -406,84 +521,55 @@ def run_agent(config: dict, logger: logging.Logger):
             memory_context=mem.get_context()
         )
 
-        # Build message list for this turn (system + sliding window)
-        messages = (
-            [{"role": "system", "content": current_system_prompt}]
-            + history[-(HISTORY_WINDOW):]
-        )
+        # Slice in pairs so no user message is orphaned without its assistant reply
+        window = history[-(HISTORY_WINDOW):]
+        if window and window[0]["role"] == "assistant":
+            window = window[1:]
+
+        messages = [{"role": "system", "content": current_system_prompt}] + window
 
         last_tool_call = None
         responded      = False
 
         for step in range(1, MAX_STEPS + 1):
             if DEBUG_MODE:
-                print(f"{COLOR_DEBUG}\r[Step {step}/{MAX_STEPS}] Thinking...{COLOR_RESET}", end="", flush=True)
+                print(f"{COLOR_DEBUG}[Step {step}/{MAX_STEPS}]{COLOR_RESET} ", end="", flush=True)
             logger.debug(f"Step {step}: sending {len(messages)} messages to model.")
 
-            # ── LLM call with one JSON-retry ──
-            full_raw_response = ""
-            data = None
-
-            for attempt in range(2):            # attempt 0 = normal, attempt 1 = retry
-                full_raw_response = ""
-                try:
-                    for chunk in service.chat(selected_model, messages, stream=True):
-                        full_raw_response += chunk
-                except RuntimeError as e:
-                    logger.error(f"Stream error on step {step}, attempt {attempt}: {e}")
-                    break
-
-                data = extract_json(full_raw_response)
-                if data:
-                    break
-
-                if attempt == 0:
-                    logger.warning(f"Step {step}: invalid JSON from model — retrying once.")
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            'Error: Your last response was not valid JSON. '
-                            'Reply with ONLY a raw JSON object — no markdown, no code fences, no extra text. '
-                            'Example: {"message": "your reply here", "tool": null, "args": []}'
-                        )
-                    })
+            data, raw = _call_llm_with_validation(
+                service, selected_model, messages, logger
+            )
 
             if not data:
-                logger.error(f"Step {step}: could not parse JSON after retry. Raw: {full_raw_response[:200]}")
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} The model returned an unreadable response. Please try rephrasing your request.")
+                logger.error(f"Step {step}: could not parse JSON after retries. Raw: {raw[:200]}")
+                print(f"({COLOR_DEBUG}could not parse a valid response — please rephrase{COLOR_RESET})")
                 break
 
-            # Support both new 'message' field and legacy 'thought' field
-            message    = data.get("message") or data.get("thought", "")
-            tool_name  = data.get("tool")
-            args       = data.get("args", [])
+            # Support both 'message' (new) and 'thought' (legacy)
+            message   = data.get("message") or data.get("thought", "")
+            tool_name = data.get("tool")
+            args      = data.get("args", [])
 
-            # Ensure args is always a list
             if not isinstance(args, list):
                 args = [args]
 
-            logger.debug(f"Step {step} | tool={tool_name} | args={args} | message={message[:80]}")
+            logger.debug(f"Step {step} | tool={tool_name} | args={args} | msg={message[:80]}")
             if DEBUG_MODE:
-                print(f"{COLOR_DEBUG}[Step {step}] tool={tool_name} | args={args}{COLOR_RESET}")
+                print(f"{COLOR_DEBUG}  → tool={tool_name} args={args}{COLOR_RESET}")
 
-            # ── No tool → final answer ──
+            # ── No tool → final answer (already streamed above) ──
             if not tool_name or str(tool_name).lower() == "null":
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {message}")
                 logger.debug(f"Agent response: {message}")
                 history.append({"role": "assistant", "content": message})
+                mem.add_interaction(user_input, message)
                 responded = True
                 break
 
             # ── Duplicate tool call guard ──
             call_signature = (tool_name, str(args))
             if call_signature == last_tool_call:
-                msg = (
-                    f"I detected a repeated identical call to '{tool_name}' — "
-                    "stopping to avoid an infinite loop. "
-                    "Please rephrase your request or check the last tool result."
-                )
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {msg}")
-                logger.warning(f"Duplicate tool call detected: {call_signature}")
+                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} Detected a repeated call to '{tool_name}' — stopping to avoid a loop.")
+                logger.warning(f"Duplicate tool call: {call_signature}")
                 responded = True
                 break
             last_tool_call = call_signature
@@ -491,56 +577,58 @@ def run_agent(config: dict, logger: logging.Logger):
             # ── Tool not in registry ──
             if tool_name not in AVAILABLE_TOOLS:
                 available = ", ".join(AVAILABLE_TOOLS.keys())
-                msg = (
-                    f"I tried to use a tool called '{tool_name}', but it doesn't exist. "
-                    f"My available tools are: {available}. "
-                    "Please rephrase your request."
+                print(
+                    f"\n{COLOR_AI}Agent:{COLOR_RESET} Unknown tool '{tool_name}'. "
+                    f"Available: {available}"
                 )
-                logger.warning(f"Unknown tool requested: '{tool_name}'")
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {msg}")
+                logger.warning(f"Unknown tool: '{tool_name}'")
                 responded = True
                 break
 
             # ── Execute tool ──
-            logger.debug(f"Executing tool: {tool_name}({args})")
             if DEBUG_MODE:
                 print(f"{COLOR_DEBUG}[*] Calling {tool_name}({', '.join(map(str, args))})...{COLOR_RESET}")
+            logger.debug(f"Executing: {tool_name}({args})")
 
             try:
                 tool_result = AVAILABLE_TOOLS[tool_name](*args)
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {tool_result}")
+                print(f"\n{COLOR_AI}[{tool_name}]{COLOR_RESET} {tool_result}")
                 logger.debug(f"Tool result [{tool_name}]: {str(tool_result)[:300]}")
             except TypeError as e:
-                tool_result = (
-                    f"Tool '{tool_name}' was called with wrong arguments: {e}. "
-                    "Please check argument types and try again."
-                )
-                logger.error(f"TypeError in tool '{tool_name}': {e}")
+                tool_result = f"Tool '{tool_name}' was called with wrong arguments: {e}."
+                logger.error(f"TypeError in '{tool_name}': {e}")
                 print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {tool_result}")
             except Exception as e:
-                tool_result = (
-                    f"An unexpected error occurred while running '{tool_name}': {e}."
-                )
-                logger.exception(f"Unexpected error in tool '{tool_name}': {e}")
+                tool_result = f"Unexpected error in '{tool_name}': {e}."
+                logger.exception(f"Error in '{tool_name}': {e}")
                 print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {tool_result}")
 
-            # Update memory and conversation
             mem.update(tool_name, str(tool_result), args)
 
-            # Tool result is already printed — add to history and stop this turn
-            history.append({"role": "assistant", "content": str(tool_result)})
-            responded = True
-            break
+            # Feed result back into messages so the model can chain tools
+            tool_msg = f"[Tool: {tool_name}] Result:\n{tool_result}"
+            messages.append({"role": "assistant", "content": tool_msg})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Tool result above is complete. "
+                    "If the task is done, respond with tool null and summarise. "
+                    "If another tool is needed, call it now."
+                )
+            })
 
         else:
-            # Loop exhausted without a break → max steps reached
+            # Loop exhausted → max steps reached
             if not responded:
-                msg = (
-                    f"I reached the maximum reasoning limit ({MAX_STEPS} steps) "
-                    "without a final answer. Please try a simpler or more specific request."
+                print(
+                    f"\n{COLOR_AI}Agent:{COLOR_RESET} Reached the {MAX_STEPS}-step limit "
+                    "without a final answer. Please try a simpler request."
                 )
-                print(f"\n{COLOR_AI}Agent:{COLOR_RESET} {msg}")
-                logger.warning(f"Max steps ({MAX_STEPS}) reached without response.")
+                logger.warning(f"Max steps ({MAX_STEPS}) reached.")
+
+        # Keep history tidy — record last tool exchange as a summary entry
+        if not responded:
+            history.append({"role": "assistant", "content": f"[Used tool chain for: {user_input}]"})
 
 
 # ─────────────────────────────────────────────
@@ -548,8 +636,23 @@ def run_agent(config: dict, logger: logging.Logger):
 # ─────────────────────────────────────────────
 
 def main():
-    config = load_config("settings.json")
-    logger = setup_logger(config["log_file"], config["log_level"])
+    global DEBUG_MODE
+
+    parser = argparse.ArgumentParser(description="Ollama Local AI Agent")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug output (overrides DEBUG env var and log_level setting)"
+    )
+    parser.add_argument(
+        "--config", default="settings.json",
+        help="Path to settings JSON file (default: settings.json)"
+    )
+    args = parser.parse_args()
+
+    DEBUG_MODE = args.debug or os.getenv("DEBUG", "false").strip().lower() == "true"
+
+    config = load_config(args.config)
+    logger = setup_logger(config["log_file"], config["log_level"], debug_mode=DEBUG_MODE)
 
     logger.info("=" * 50)
     logger.info(f"Agent session started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
