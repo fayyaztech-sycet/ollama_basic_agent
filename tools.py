@@ -218,9 +218,9 @@ def run_safe_command(base_cmd: str, *args) -> str:
             f"Available commands: {available}"
         )
 
-    # Expand ~ in all string arguments
+    # Expand ~ in string arguments that look like paths (not flags like -h)
     expanded_args = [
-        _safe_path(a) if isinstance(a, str) else a
+        _safe_path(a) if isinstance(a, str) and not a.startswith("-") else a
         for a in args
     ]
 
@@ -672,6 +672,29 @@ def upload_file(filepath: str, destination: str) -> str:
         return f"Error uploading '{filepath}': {e}"
 
 
+def internet_speed() -> str:
+    """Test internet download and upload speed using speedtest-cli."""
+    try:
+        import speedtest as _speedtest
+        st = _speedtest.Speedtest()
+        st.get_best_server()
+        download_bps = st.download()
+        upload_bps   = st.upload()
+        ping_ms      = st.results.ping
+        server       = st.results.server
+        return (
+            f"Ping:     {ping_ms:.1f} ms\n"
+            f"Download: {download_bps / 1_000_000:.2f} Mbps\n"
+            f"Upload:   {upload_bps   / 1_000_000:.2f} Mbps\n"
+            f"Server:   {server.get('sponsor', 'unknown')} ({server.get('name', '')})"
+        )
+    except ImportError:
+        return "Error: 'speedtest-cli' is not installed. Run ./setup.sh to install it."
+    except Exception as e:
+        logger.exception(f"internet_speed failed: {e}")
+        return f"Error running speed test: {e}"
+
+
 def _ollama_chat(prompt: str, system: str) -> str:
     """Internal helper: send a single prompt to Ollama and return the reply."""
     import requests as _requests
@@ -905,6 +928,7 @@ AVAILABLE_TOOLS = {
     "network_status":     network_status,
     "ping_host":          ping_host,
     "traceroute_host":    traceroute_host,
+    "internet_speed":     internet_speed,
     # File transfer
     "download_file":      download_file,
     "upload_file":        upload_file,

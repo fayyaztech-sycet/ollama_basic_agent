@@ -116,7 +116,9 @@ STRICT RULES:
 3. For actionable requests (status, ping, list files, etc.): set "tool" to the correct tool name and call it — do NOT just describe what you would do.
 4. NEVER provide manual terminal commands for the user to run yourself.
 5. "args" MUST always be a JSON array, even when empty: [].
-6. PATIENCE: Never open a file or run a command unless explicitly asked.
+6. FLAGS vs PATHS: When passing flags like -h, -l, -a to run_safe_command, keep them as-is (e.g. ["df", "-h"] not ["-h"] as a path). Flags always come before paths.
+7. CONTEXT: If the answer can be derived from a previous tool result already in the conversation, answer directly with tool null — do NOT call the tool again.
+8. After calling a tool the result is shown immediately. Your job for that turn is done — do not add commentary unless the user asks.
 
 AVAILABLE TOOLS:
 System:
@@ -140,6 +142,7 @@ Network:
 - network_status(): Show network interfaces and I/O stats.
 - ping_host(host): Ping a host 4 times.
 - traceroute_host(host): Run traceroute to a host.
+- internet_speed(): Test internet download/upload speed and ping.
 
 File Transfer:
 - download_file(url, dest): Download a file from an HTTP/HTTPS/FTP URL (curl).
@@ -524,9 +527,10 @@ def run_agent(config: dict, logger: logging.Logger):
             # Update memory and conversation
             mem.update(tool_name, str(tool_result), args)
 
-            # Only append the tool result as a user-facing message (do not print again)
+            # Tool result is already printed — add to history and stop this turn
             history.append({"role": "assistant", "content": str(tool_result)})
-            messages.append({"role": "assistant", "content": str(tool_result)})
+            responded = True
+            break
 
         else:
             # Loop exhausted without a break → max steps reached
