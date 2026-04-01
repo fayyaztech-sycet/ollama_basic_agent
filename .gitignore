@@ -1,13 +1,22 @@
+# Virtual environment
 .venv/
-__pycache__/
-*.pyc
-.DS_Store
-*.mp4
-*.mkv
-*.webm
-*.avi
-memory.json
-agent.log
-settings.json
+
+# Local environment config (contains secrets/personal settings)
 .env
-.ollama_agent_token_log.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
